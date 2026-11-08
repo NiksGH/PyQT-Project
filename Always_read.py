@@ -1,11 +1,122 @@
 import sys
+import hashlib
+import hmac
+import os
+import sqlite3
+from pathlib import Path
 from PyQt5.QtGui import *
 from PyQt5.QtCore import *
 from PyQt5.QtWidgets import *
-import sqlite3
 
-con = sqlite3.connect("database.db")
-cur = con.cursor()
+DATABASE_PATH = Path(__file__).resolve().with_name("database.db")
+PASSWORD_HASH_ITERATIONS = 600_000
+
+con = None
+cur = None
+
+
+def initialize_database():
+    """Create an empty local catalog database if one does not exist."""
+    global con, cur
+    con = sqlite3.connect(str(DATABASE_PATH))
+    con.execute("PRAGMA foreign_keys = ON")
+    cur = con.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            login TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'reader'))
+        );
+        CREATE TABLE IF NOT EXISTS authors (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            date_of_birth TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            genres TEXT NOT NULL,
+            author INTEGER NOT NULL REFERENCES authors (id),
+            renter INTEGER REFERENCES users (id)
+        );
+    """)
+    con.commit()
+
+
+def hash_password(password):
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
+
+
+def setup_initial_accounts():
+    """Ask for local demo accounts on first launch; never ship credentials."""
+    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        return True
+
+    QMessageBox.information(
+        None,
+        "Первоначальная настройка",
+        "Создайте учётные записи библиотекаря и читателя. Пароли будут храниться в виде хешей.",
+    )
+    def prompt_account(label, role):
+        while True:
+            login, accepted = QInputDialog.getText(
+                None, "Первоначальная настройка", f"Логин {label}:"
+            )
+            if not accepted:
+                return None
+            password, accepted = QInputDialog.getText(
+                None,
+                "Первоначальная настройка",
+                f"Пароль {label} (не менее 8 символов):",
+                QLineEdit.Password,
+            )
+            if not accepted:
+                return None
+            if login.strip() and len(password) >= 8:
+                return (login.strip(), hash_password(password), role)
+            QMessageBox.warning(
+                None,
+                "Некорректные данные",
+                "Логин не должен быть пустым, пароль — не короче 8 символов.",
+            )
+
+    admin_account = prompt_account("библиотекаря", "admin")
+    if admin_account is None:
+        return False
+
+    while True:
+        reader_account = prompt_account("читателя", "reader")
+        if reader_account is None:
+            return False
+        if admin_account[0].casefold() != reader_account[0].casefold():
+            break
+        QMessageBox.warning(None, "Некорректные данные", "Логины должны отличаться.")
+
+    cur.executemany(
+        "INSERT INTO users (login, password_hash, role) VALUES (?, ?, ?)",
+        (admin_account, reader_account),
+    )
+    con.commit()
+    return True
 
 LOGIN_SCREEN_INDEX = 0
 SHELF_SCREEN_INDEX = 1
@@ -58,6 +169,7 @@ class App(QWidget):
 
         self.loginScreen_password = QLineEdit()
         self.loginScreen_password.setPlaceholderText('Пароль')
+        self.loginScreen_password.setEchoMode(QLineEdit.Password)
         self.loginScreen_password.setStyleSheet('QLineEdit {background-color: rgb(69, 92, 114); color: white;}')
         layout.addWidget(self.loginScreen_password)
 
@@ -75,14 +187,14 @@ class App(QWidget):
         self.loginScreen.setLayout(layout)
 
     def auth(self):
-        l = self.loginScreen_login.text()
+        l = self.loginScreen_login.text().strip()
         p = self.loginScreen_password.text()
         if len(l) > 0 and len(p) > 0:
-            result = cur.execute("""SELECT password, role FROM users
+            result = cur.execute("""SELECT password_hash, role FROM users
                 WHERE login = ?""", (l,)).fetchall()
             if len(result) == 0:
                 self.loginScreen_error.setText('Неверный логин')
-            elif result[0][0] != p:
+            elif not verify_password(p, result[0][0]):
                 self.loginScreen_error.setText('Неверный пароль')
             else:
                 self.current_user_role = result[0][1]
@@ -747,6 +859,10 @@ class AuthorInfo(QWidget):
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    initialize_database()
+    if not setup_initial_accounts():
+        con.close()
+        sys.exit(0)
     demo = App()
     demo.show()
     sys.exit(app.exec_())
